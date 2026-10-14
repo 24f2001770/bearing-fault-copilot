@@ -10,7 +10,8 @@ import numpy as np
 from .data_loading import RECORDINGS, load_recording, windows
 from .evaluate import RESULTS
 from .features import extract
-from .predict import UNCERTAIN_THRESHOLD, evidence, list_recordings, predict
+from .config import HIGH_UNCERTAINTY_BELOW as HIGH, LOW_UNCERTAINTY_AT_OR_ABOVE as LOW
+from .predict import evidence, list_recordings, predict
 from .train import MODEL_PATHS
 
 FAMILY = {"inner_race": "BPFI", "outer_race": "BPFO", "ball": "BSF"}
@@ -54,11 +55,11 @@ if __name__ == "__main__":
         pred, conf = wt["demo"]
         evs = [evidence(rid, i) for i in range(r["n_windows"])]
         tops = [top_env(e) for e in evs]
-        env_match = np.array([t is not None and t["strength"] != "low" and t["matches"] == FAMILY.get(true) for t in tops])
-        strong = np.array([t is not None and t["strength"] == "high" and t["matches"] == FAMILY.get(true) for t in tops])
-        good = (pred == true) & (conf >= 0.9) & strong
-        rows.append((rid, true, r["n_windows"], np.mean(pred == true), conf.mean(), np.mean(conf < UNCERTAIN_THRESHOLD),
-                     np.mean(env_match) if true in FAMILY else float("nan"),
+        env_match = np.array([t is not None and t["matches"] == FAMILY.get(true) for t in tops])
+        disagree = sum(t is not None and t["matches"] != FAMILY.get(str(p)) for t, p in zip(tops, pred))
+        good = (pred == true) & (conf >= LOW) & env_match
+        rows.append((rid, true, r["n_windows"], np.mean(pred == true), conf.mean(), np.mean(conf < HIGH),
+                     np.mean([t is not None for t in tops]), np.mean(env_match) if true in FAMILY else float("nan"), disagree,
                      ", ".join(f"{c}:{n}" for c, n in zip(*np.unique(pred, return_counts=True)))))
         if true in ("inner_race", "outer_race"):
             hero_cands.append((good.mean(), rid, longest_run(good)))
@@ -66,15 +67,16 @@ if __name__ == "__main__":
     lines = ["# Demo picks (held-out 3 hp recordings, demo model never trained on them)", "",
              "Reproduce: `python -m sensor.demo_picks`. Window = 2048 samples (0.171 s); window i starts at i x 1024 samples.", "",
              "## All held-out recordings (window level, demo model)", "",
-             "| recording | true | windows | acc | mean conf | % conf < 0.6 | strongest envelope peak = true family (>= medium) | predictions |",
-             "|---|---|---|---|---|---|---|---|"]
-    lines += [f"| {a} | {b} | {c} | {d:.3f} | {e:.3f} | {f:.1%} | {'n/a' if np.isnan(g) else f'{g:.1%}'} | {h} |" for a, b, c, d, e, f, g, h in rows]
+             f"| recording | true | windows | acc | mean conf | % conf < {HIGH:g} | evidence non-empty | strongest peak = true family | evidence disagrees with prediction (windows) | predictions |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    lines += [f"| {a} | {b} | {c} | {d:.3f} | {e:.3f} | {f:.1%} | {ne:.1%} | {'n/a' if np.isnan(g) else f'{g:.1%}'} | {dis} | {h} |"
+              for a, b, c, d, e, f, ne, g, dis, h in rows]
 
     lines += ["", "## Demo model vs all-data model on the same 1534 held-out windows", "",
-              "| model | trained on | acc | mean conf | % conf == 1.0 | % conf < 0.6 |", "|---|---|---|---|---|---|"]
+              f"| model | trained on | acc | mean conf | % conf == 1.0 | % conf < {HIGH:g} |", "|---|---|---|---|---|---|"]
     for v, trained in [("demo", "loads 0/1/2 (default)"), ("all", "all 40 recordings (in-sample here)")]:
         ok = np.concatenate([a for a, _ in comp[v]]); c = np.concatenate([b for _, b in comp[v]])
-        lines.append(f"| {v} | {trained} | {ok.mean():.3f} | {c.mean():.3f} | {np.mean(c == 1.0):.1%} | {np.mean(c < UNCERTAIN_THRESHOLD):.1%} |")
+        lines.append(f"| {v} | {trained} | {ok.mean():.3f} | {c.mean():.3f} | {np.mean(c == 1.0):.1%} | {np.mean(c < HIGH):.1%} |")
 
     def pick_block(title, rid, lo, hi, show):
         p = predict(rid, show)
@@ -83,7 +85,7 @@ if __name__ == "__main__":
                 f"- prediction: **{p['fault_type']} / {p['severity']}**, confidence **{p['confidence']}**, probabilities {json.dumps(p['probabilities'])}",
                 f"- evidence: `{json.dumps(ev[:2])}`", ""]
 
-    lines += ["", "## Hero picks (correct, confidence >= 0.9, strongest envelope peak = true fault family at high strength)", "",
+    lines += ["", f"## Hero picks (correct, uncertainty level low: confidence >= {LOW:g}, evidence non-empty with strongest peak = true fault family)", "",
               "Ranked by the share of windows meeting all three; window range = longest consecutive run.", ""]
     hero_cands.sort(reverse=True)
     best_ir = next(h for h in hero_cands if h[1].startswith("IR"))
@@ -94,14 +96,14 @@ if __name__ == "__main__":
 
     rid = max(rows, key=lambda r: r[5])[0]
     pred, conf = window_table({"demo": models["demo"]}, rid)["demo"]
-    unc = np.flatnonzero(conf < UNCERTAIN_THRESHOLD)
-    lo, hi, n = longest_run(conf < UNCERTAIN_THRESHOLD)
-    lines += ["## Uncertain pick (triggers the 0.6 warning, for the human-confirm moment)", "",
+    unc = np.flatnonzero(conf < HIGH)
+    lo, hi, n = longest_run(conf < HIGH)
+    lines += [f"## Uncertain pick (uncertainty level high: confidence < {HIGH:g}, for the human-confirm moment)", "",
               f"Recording with the most uncertain windows: `{rid}`. Uncertain windows: {len(unc)} of {len(conf)} ({len(unc) / len(conf):.1%}): {unc.tolist()}.",
               f"Among uncertain windows, correct: {np.mean(pred[unc] == RECORDINGS[rid]['fault_type']):.1%}; "
               f"window-level acc overall {np.mean(pred == RECORDINGS[rid]['fault_type']):.3f}, mean conf {conf.mean():.3f}.", ""]
     show = lo + int(np.argmin(conf[lo:hi + 1]))
-    lines += pick_block(f"Uncertain (longest run of {n} consecutive windows below 0.6)", rid, lo, hi, show)
+    lines += pick_block(f"Uncertain (longest run of {n} consecutive windows below {HIGH:g})", rid, lo, hi, show)
 
     (RESULTS / "demo_picks.md").write_text("\n".join(lines) + "\n", newline="\n")
     print("\n".join(lines))

@@ -7,6 +7,7 @@ Windows of one recording are never split across train and test.
 
 python -m sensor.evaluate            report for FINAL_VARIANT -> results/results.md + confusion_lolo.png
 python -m sensor.evaluate --compare  all feature variants side by side + inner-CV selection -> results/variants.md
+python -m sensor.evaluate --evidence  evidence() threshold sweep + held-out non-empty rates -> results/evidence.md
 python -m sensor.evaluate --bands     accuracy per confidence band (for uncertainty.level) -> results/confidence_bands.md
 python -m sensor.evaluate --or-positions  outer race @3/@12 o'clock (unseen bearings) -> results/or_positions.md
 python -m sensor.evaluate --ttd      time-to-detect on the held-out demo recordings -> results/time_to_detect.md
@@ -25,7 +26,8 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 from .data_loading import RECORDINGS
 from .features import VARIANTS
-from .predict import FAULT_TYPES, UNCERTAIN_THRESHOLD
+from .config import HIGH_UNCERTAINTY_BELOW, LOW_UNCERTAINTY_AT_OR_ABOVE
+from .predict import FAULT_TYPES
 from .train import FINAL_VARIANT, SEED, build_dataset, fit
 
 warnings.filterwarnings("ignore", "Mean of empty slice")  # all-NaN severity column in size-out table
@@ -56,9 +58,9 @@ def run_fold(X, y_type, y_sev, rec, train, test, variant=FINAL_VARIANT):
         "sev_acc": accuracy_score(y_sev[test][faulty], sev_pred),
         "base_acc": np.mean(y_type[test] == majority),
         "sev_base_acc": np.mean(y_sev[test][faulty] == sev_majority),
-        "uncertain": np.mean(conf < UNCERTAIN_THRESHOLD),
-        "acc_confident": ok[conf >= UNCERTAIN_THRESHOLD].mean(),
-        "acc_uncertain": ok[conf < UNCERTAIN_THRESHOLD].mean() if (conf < UNCERTAIN_THRESHOLD).any() else float("nan"),
+        "uncertain": np.mean(conf < HIGH_UNCERTAINTY_BELOW),
+        "acc_confident": ok[conf >= HIGH_UNCERTAINTY_BELOW].mean(),
+        "acc_uncertain": ok[conf < HIGH_UNCERTAINTY_BELOW].mean() if (conf < HIGH_UNCERTAINTY_BELOW).any() else float("nan"),
         "n_test": len(test),
         "conf": conf,
         "pred": pred,
@@ -68,7 +70,7 @@ def run_fold(X, y_type, y_sev, rec, train, test, variant=FINAL_VARIANT):
 
 
 COLS = ["acc", "f1", "sev_acc", "base_acc", "sev_base_acc", "uncertain", "acc_confident", "acc_uncertain"]
-HEAD = "| fold | n_test | fault acc | fault macro-F1 | severity acc | majority baseline (fault) | majority baseline (severity) | % uncertain (<0.6) | acc when confident | acc when uncertain |"
+HEAD = f"| fold | n_test | fault acc | fault macro-F1 | severity acc | majority baseline (fault) | majority baseline (severity) | % uncertain (<{HIGH_UNCERTAINTY_BELOW:g}) | acc when confident | acc when uncertain |"
 
 
 def lolo_splits(load, idx):
@@ -101,7 +103,7 @@ def table(title, rows):
     return "\n".join(lines)
 
 
-def confidence_bands(X, y_type, y_sev, rec, load, cuts=(0.6, 0.7, 0.8, 0.9, 0.95)):
+def confidence_bands(X, y_type, y_sev, rec, load, cuts=(HIGH_UNCERTAINTY_BELOW, 0.7, 0.8, 0.9, LOW_UNCERTAINTY_AT_OR_ABOVE)):
     """Accuracy per confidence band, from out-of-fold predictions only (no window scored by a model that trained on it).
     Used to map sensor confidence to the final answer's uncertainty.level."""
     idx = np.arange(len(X))
@@ -119,6 +121,107 @@ def confidence_bands(X, y_type, y_sev, rec, load, cuts=(0.6, 0.7, 0.8, 0.9, 0.95
             lines.append(f"| {name} | {label} | {m.sum()} | {m.mean():.1%} | {ok[m].mean():.3f} |" if m.any() else f"| {name} | {label} | 0 | 0.0% | - |")
     md = "\n".join(lines)
     (RESULTS / "confidence_bands.md").write_text(md + "\n", newline="\n")
+    print(md)
+
+
+def evidence_report(thresholds=(1.0, 1.5, 2.0, 2.5, 3.0, 4.0)):
+    """How often evidence() is non-empty, and whether its strongest peak names the true fault family.
+    Threshold chosen on training loads 0/1/2 (demo model baseline); held-out 3 hp reported before/after."""
+    import joblib
+    from .config import EVIDENCE_MIN_VS_NORMAL
+    from .data_loading import load_recording, windows
+    from .predict import window_evidence
+    from .train import DEMO_TEST_LOAD, MODEL_PATHS
+    ref = joblib.load(MODEL_PATHS["demo"])["normal_env_p99"]
+    family = {"inner_race": "BPFI", "outer_race": "BPFO", "ball": "BSF"}
+
+    def rates(rids, t):
+        top = []
+        for rid in rids:
+            sig, rpm = load_recording(rid)
+            for w in windows(sig):
+                ev = window_evidence(w, rpm, ref, t)
+                top.append(ev[0]["matches"] if ev else None)
+        true = family.get(RECORDINGS[rids[0]]["fault_type"])
+        top = np.array(top, dtype=object)
+        ne = top != None  # noqa: E711 (elementwise)
+        return ne.mean(), np.mean(ne & (top == true)), np.mean(ne & (top != true))
+
+    conds = list(dict.fromkeys(m["condition"] for m in RECORDINGS.values()))
+    lines = ["### evidence(): non-empty rate and strongest-peak family", "",
+             "Cells: % windows non-empty / strongest peak = true family / strongest peak = wrong family.", "",
+             "#### Threshold sweep on training loads 0/1/2 (used to choose EVIDENCE_MIN_VS_NORMAL)", "",
+             "| condition | " + " | ".join(f"T = {t:g}" for t in thresholds) + " |", "|---" * (len(thresholds) + 1) + "|"]
+    worst = {t: 0.0 for t in thresholds}
+    for c in conds:
+        rids = [r for r, m in RECORDINGS.items() if m["condition"] == c and m["load_hp"] != DEMO_TEST_LOAD]
+        cells = []
+        for t in thresholds:
+            ne, right, wrong = rates(rids, t)
+            worst[t] = max(worst[t], wrong)
+            cells.append(f"{ne:.0%} / {right:.0%} / {wrong:.0%}")
+        lines.append(f"| {c} | " + " | ".join(cells) + " |")
+    lines.append("| **worst wrong-family rate** | " + " | ".join(f"**{worst[t]:.0%}**" for t in thresholds) + " |")
+    chosen = min(t for t in thresholds if worst[t] <= 0.05)
+    lines += ["", f"Rule: smallest T with wrong-family rate <= 5% for every condition -> **{chosen:g}** "
+              f"(configured EVIDENCE_MIN_VS_NORMAL = {EVIDENCE_MIN_VS_NORMAL:g}).", "",
+              f"#### Held-out 3 hp windows, before (T = 1) and after (T = {EVIDENCE_MIN_VS_NORMAL:g})", "",
+              "| fault type | recordings | windows | non-empty before | non-empty after | right family after | wrong family after |",
+              "|---|---|---|---|---|---|---|"]
+    for ft in FAULT_TYPES:
+        rows = []
+        for c in conds:
+            rid = f"{c}_{DEMO_TEST_LOAD}"
+            if RECORDINGS[rid]["fault_type"] == ft:
+                n = len(windows(load_recording(rid)[0]))
+                rows.append((rid, n, rates([rid], 1.0)[0], *rates([rid], EVIDENCE_MIN_VS_NORMAL)))
+        for rid, n, before, ne, right, wrong in rows:
+            lines.append(f"| {ft} | {rid} | {n} | {before:.1%} | {ne:.1%} | {right:.1%} | {wrong:.1%} |")
+        tot = sum(r[1] for r in rows)
+        avg = [sum(r[1] * r[k] for r in rows) / tot for k in (2, 3, 4, 5)]
+        lines.append(f"| **{ft}** | **all** | **{tot}** | **{avg[0]:.1%}** | **{avg[1]:.1%}** | **{avg[2]:.1%}** | **{avg[3]:.1%}** |")
+
+    # Precision and disagreement with the classifier (demo model) on the held-out windows, at the configured threshold.
+    m = joblib.load(MODEL_PATHS["demo"])
+    from .features import extract
+    lines += ["", f"#### Held-out 3 hp windows: precision and disagreement with the classifier (T = {EVIDENCE_MIN_VS_NORMAL:g}, demo model)", "",
+              "Precision = among windows with non-empty evidence, strongest peak names the true fault family. "
+              "Disagreement = evidence non-empty and its strongest peak names a different family than the classifier's fault_type "
+              "(a classifier call of normal with non-empty evidence counts as disagreement).", "",
+              "| fault type | windows | evidence non-empty | precision | disagreement (of all windows) | disagreement (of non-empty) |",
+              "|---|---|---|---|---|---|"]
+    per_window = {}
+    for ft in FAULT_TYPES:
+        n = ne = right = dis = 0
+        for c in conds:
+            rid = f"{c}_{DEMO_TEST_LOAD}"
+            if RECORDINGS[rid]["fault_type"] != ft:
+                continue
+            sig, rpm = load_recording(rid)
+            w = windows(sig)
+            pred = m["fault_type"].predict(extract(w, rpm)[:, m["cols"]])
+            for i, (win, p) in enumerate(zip(w, pred)):
+                ev = window_evidence(win, rpm, ref)
+                per_window[(rid, i)] = (str(p), ev)
+                n += 1
+                if ev:
+                    ne += 1
+                    right += ev[0]["matches"] == family.get(ft)
+                    dis += ev[0]["matches"] != family.get(str(p))
+        prec = f"{right / ne:.1%} ({right}/{ne})" if ne else "n/a (0 non-empty)"
+        dis_ne = f"{dis / ne:.1%} ({dis}/{ne})" if ne else "n/a"
+        lines.append(f"| {ft} | {n} | {ne / n:.1%} ({ne}) | {prec} | {dis / n:.1%} ({dis}) | {dis_ne} |")
+
+    # The uncertain demo pick (results/demo_picks.md): OR014@6_3 windows 111-115.
+    lines += ["", "#### OR014@6_3 (uncertain demo pick, true fault outer_race), windows 111-115", "",
+              "| window | classifier fault_type | evidence |", "|---|---|---|"]
+    for i in range(111, 116):
+        p, ev = per_window[("OR014@6_3", i)]
+        lines.append(f"| {i} | {p} | {[(e['matches'], e['harmonic'], e['vs_normal']) for e in ev] or '[]'} |")
+    ne_all = sum(1 for (rid, _), (_, ev) in per_window.items() if rid == "OR014@6_3" and ev)
+    lines.append(f"\nAll {sum(1 for rid, _ in per_window if rid == 'OR014@6_3')} OR014@6_3 windows: evidence non-empty in {ne_all}.")
+    md = "\n".join(lines)
+    (RESULTS / "evidence.md").write_text(md + "\n", newline="\n")
     print(md)
 
 
@@ -148,7 +251,7 @@ def or_positions():
 def time_to_detect(start_every=5):
     """Stream consecutive windows of each held-out demo recording (demo model, never trained on load 3) from many
     start points. Detected = majority vote of window predictions is the true fault_type AND the mean probability of
-    that class over the windows so far >= UNCERTAIN_THRESHOLD. Time = seconds of signal consumed."""
+    that class over the windows so far >= HIGH_UNCERTAINTY_BELOW. Time = seconds of signal consumed."""
     import joblib
     from .data_loading import SAMPLE_RATE_HZ, WINDOW, OVERLAP, load_recording, windows
     from .features import extract
@@ -168,7 +271,7 @@ def time_to_detect(start_every=5):
             t = None
             for k in range(1, len(proba) - s0 + 1):
                 v = np.bincount(votes[s0:s0 + k], minlength=len(classes))
-                if v.argmax() == true and v[true] > k / 2 and proba[s0:s0 + k, true].mean() >= UNCERTAIN_THRESHOLD:
+                if v.argmax() == true and v[true] > k / 2 and proba[s0:s0 + k, true].mean() >= HIGH_UNCERTAINTY_BELOW:
                     t = (k - 1) * step_s + win_s
                     break
             times.setdefault(meta["fault_type"], []).append((rid, t))
@@ -192,6 +295,10 @@ if __name__ == "__main__":
     X, y_type, y_sev, rec, load = build_dataset()
     all_idx = np.arange(len(X))
     print("dataset:", X.shape)
+
+    if "--evidence" in sys.argv:
+        evidence_report()
+        sys.exit()
 
     if "--bands" in sys.argv:
         confidence_bands(X, y_type, y_sev, rec, load)
