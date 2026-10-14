@@ -1,0 +1,57 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ---- Raw data and source documents: link to them, do not commit them ----
+data/raw/
+data/processed/
+data/cache/
+data/**/*.pdf
+*.mat
+
+# ---- Search indexes and vector stores (rebuilt by a script) ----
+rag/index/
+rag/.chroma/
+chroma/
+*.faiss
+*.index
+
+# ---- Model weights and large artifacts ----
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
+*.ckpt
+*.h5
+*.bin
+models/
+checkpoints/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ---- Notebooks ----
+.ipynb_checkpoints/
+
+# ---- Node (frontend tooling, if used) ----
+node_modules/
+
+# ---- Editors and OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

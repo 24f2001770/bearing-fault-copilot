@@ -1,0 +1,6 @@
+# Keep line endings the same on Windows, Mac and Linux
+* text=auto eol=lf
+*.mat binary
+*.pdf binary
+*.png binary
+*.jpg binary
